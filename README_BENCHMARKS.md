@@ -13,7 +13,7 @@ go test -bench=. -benchmem -count=3 ./...
 ```
 goos: linux
 goarch: amd64
-pkg: github.com/ratelimiter/ratelimiter
+pkg: github.com/seanrobmerriam/rate-limiter-go
 cpu: Intel(R) Core(TM) i3-4010U CPU @ 1.70GHz
 BenchmarkTokenBucket_MemoryStore-4              	 4409268	       270.3 ns/op	       0 B/op	       0 allocs/op
 BenchmarkTokenBucket_MemoryStore-4              	 4216912	       289.1 ns/op	       0 B/op	       0 allocs/op

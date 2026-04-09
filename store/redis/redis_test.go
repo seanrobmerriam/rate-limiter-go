@@ -2,80 +2,55 @@ package redis
 
 import (
 	"context"
-	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/ratelimiter/ratelimiter"
-	redigo "github.com/redis/go-redis/v9"
+	"github.com/alicebob/miniredis/v2"
+	ratelimiter "github.com/seanrobmerriam/rate-limiter-go"
 	"github.com/stretchr/testify/assert"
-	"github.com/testcontainers/testcontainers-go/modules/redis"
 )
 
-func isLocalRedisAvailable() bool {
-	conn, err := net.DialTimeout("tcp", "localhost:6379", 2*time.Second)
-	if err != nil {
-		return false
-	}
-	conn.Close()
-	return true
+type testRedisContainer struct {
+	server *miniredis.Miniredis
 }
 
-func tryLocalRedis() *redigo.Client {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	client := redigo.NewClient(&redigo.Options{
-		Addr: "localhost:6379",
-	})
-	err := client.Ping(ctx).Err()
-	if err != nil {
-		client.Close()
+func (c *testRedisContainer) Terminate(ctx context.Context) error {
+	if c == nil || c.server == nil {
 		return nil
 	}
-	return client
+	c.server.Close()
+	return nil
 }
 
-func startRedisContainer(t *testing.T) (*redis.RedisContainer, string) {
-	ctx := context.Background()
+func startRedisContainer(t *testing.T) (*testRedisContainer, string) {
+	t.Helper()
 
-	if isLocalRedisAvailable() {
-		client := tryLocalRedis()
-		if client != nil {
-			t.Log("Using local Redis at localhost:6379")
-			return nil, "localhost:6379"
-		}
-	}
+	server := miniredis.RunT(t)
+	return &testRedisContainer{server: server}, server.Addr()
+}
 
-	redisContainer, err := redis.Run(ctx, "redis:7-alpine")
+func newTestRedisStore(t *testing.T) *RedisStore {
+	t.Helper()
+
+	server := miniredis.RunT(t)
+	t.Cleanup(server.Close)
+
+	store, err := New(server.Addr())
 	if err != nil {
-		t.Skipf("Failed to start Redis container: %v", err)
+		t.Fatalf("Failed to create Redis store: %v", err)
 	}
+	t.Cleanup(func() {
+		assert.NoError(t, store.Close())
+	})
 
-	connStr, err := redisContainer.ConnectionString(ctx)
-	if err != nil {
-		t.Skipf("Failed to get Redis connection string: %v", err)
-	}
-
-	return redisContainer, connStr
+	return store
 }
 
 func TestTokenBucket_BurstAllowsFirstRequests(t *testing.T) {
 	ctx := context.Background()
-	container, connStr := startRedisContainer(t)
-	if container != nil {
-		defer container.Terminate(ctx)
-	}
-
-	store, err := New(connStr)
-	if err != nil {
-		t.Fatalf("Failed to create Redis store: %v", err)
-	}
-	defer store.Close()
-
-	store.client.FlushDB(ctx)
+	store := newTestRedisStore(t)
 
 	key := ratelimiter.Key("test-burst")
 	cfg := ratelimiter.Config{
@@ -95,18 +70,7 @@ func TestTokenBucket_BurstAllowsFirstRequests(t *testing.T) {
 
 func TestTokenBucket_11thRequestDenied(t *testing.T) {
 	ctx := context.Background()
-	container, connStr := startRedisContainer(t)
-	if container != nil {
-		defer container.Terminate(ctx)
-	}
-
-	store, err := New(connStr)
-	if err != nil {
-		t.Fatalf("Failed to create Redis store: %v", err)
-	}
-	defer store.Close()
-
-	store.client.FlushDB(ctx)
+	store := newTestRedisStore(t)
 
 	key := ratelimiter.Key("test-11th")
 	cfg := ratelimiter.Config{
@@ -127,6 +91,75 @@ func TestTokenBucket_11thRequestDenied(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, ratelimiter.Denied, result.Status)
 	assert.Greater(t, result.RetryAfter, time.Duration(0))
+}
+
+func TestTokenBucket_SubsecondWindowRespectsRefillTiming(t *testing.T) {
+	ctx := context.Background()
+	store := newTestRedisStore(t)
+
+	key := ratelimiter.Key("test-subsecond-token-bucket")
+	rate := 1
+	window := 200 * time.Millisecond
+	burst := 1
+
+	result, err := store.TokenBucketCheck(ctx, key, rate, burst, window)
+	assert.NoError(t, err)
+	assert.Equal(t, ratelimiter.Allowed, result.Status)
+
+	result, err = store.TokenBucketCheck(ctx, key, rate, burst, window)
+	assert.NoError(t, err)
+	assert.Equal(t, ratelimiter.Denied, result.Status)
+	assert.Greater(t, result.RetryAfter, time.Duration(0))
+
+	time.Sleep(220 * time.Millisecond)
+
+	result, err = store.TokenBucketCheck(ctx, key, rate, burst, window)
+	assert.NoError(t, err)
+	assert.Equal(t, ratelimiter.Allowed, result.Status)
+}
+
+func TestSlidingWindow_SubsecondWindowExpiresEntriesAfterWindow(t *testing.T) {
+	ctx := context.Background()
+	store := newTestRedisStore(t)
+
+	key := ratelimiter.Key("test-subsecond-sliding-window")
+	rate := 1
+	window := 200 * time.Millisecond
+
+	result, err := store.SlidingWindowCheck(ctx, key, rate, window)
+	assert.NoError(t, err)
+	assert.Equal(t, ratelimiter.Allowed, result.Status)
+
+	result, err = store.SlidingWindowCheck(ctx, key, rate, window)
+	assert.NoError(t, err)
+	assert.Equal(t, ratelimiter.Denied, result.Status)
+
+	time.Sleep(220 * time.Millisecond)
+
+	result, err = store.SlidingWindowCheck(ctx, key, rate, window)
+	assert.NoError(t, err)
+	assert.Equal(t, ratelimiter.Allowed, result.Status)
+}
+
+func TestSlidingWindow_RetryAfterTracksRemainingWindow(t *testing.T) {
+	ctx := context.Background()
+	store := newTestRedisStore(t)
+
+	key := ratelimiter.Key("test-sliding-window-retry-after")
+	rate := 1
+	window := 300 * time.Millisecond
+
+	result, err := store.SlidingWindowCheck(ctx, key, rate, window)
+	assert.NoError(t, err)
+	assert.Equal(t, ratelimiter.Allowed, result.Status)
+
+	time.Sleep(120 * time.Millisecond)
+
+	result, err = store.SlidingWindowCheck(ctx, key, rate, window)
+	assert.NoError(t, err)
+	assert.Equal(t, ratelimiter.Denied, result.Status)
+	assert.GreaterOrEqual(t, result.RetryAfter, 150*time.Millisecond)
+	assert.LessOrEqual(t, result.RetryAfter, 250*time.Millisecond)
 }
 
 func TestTokenBucket_RefillsAfterWindow(t *testing.T) {

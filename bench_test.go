@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ratelimiter/ratelimiter"
-	"github.com/ratelimiter/ratelimiter/middleware"
-	"github.com/ratelimiter/ratelimiter/store/memory"
+	ratelimiter "github.com/seanrobmerriam/rate-limiter-go"
+	"github.com/seanrobmerriam/rate-limiter-go/middleware"
+	"github.com/seanrobmerriam/rate-limiter-go/store/memory"
 )
 
 func BenchmarkTokenBucket_MemoryStore(b *testing.B) {

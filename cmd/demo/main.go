@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"os"
@@ -9,10 +10,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ratelimiter/ratelimiter"
-	"github.com/ratelimiter/ratelimiter/middleware"
-	"github.com/ratelimiter/ratelimiter/store/memory"
-	"github.com/ratelimiter/ratelimiter/store/redis"
+	ratelimiter "github.com/seanrobmerriam/rate-limiter-go"
+	"github.com/seanrobmerriam/rate-limiter-go/middleware"
+	"github.com/seanrobmerriam/rate-limiter-go/store/memory"
+	"github.com/seanrobmerriam/rate-limiter-go/store/redis"
 )
 
 func main() {
@@ -25,26 +26,7 @@ func main() {
 	logger.Info("store initialized", "backend", backend)
 
 	limiter := ratelimiter.New(store)
-
-	rateLimitCfg := ratelimiter.Config{
-		Algorithm: ratelimiter.TokenBucket,
-		Rate:      10,
-		BurstSize: 20,
-		Window:    time.Second,
-	}
-
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("pong"))
-	})
-
-	rateLimitedHandler := middleware.Middleware(limiter, rateLimitCfg, extractKey)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"message":"resource accessed"}`))
-	}))
-	mux.Handle("/api/resource", rateLimitedHandler)
+	mux, _ := buildMux(limiter, demoConfig())
 
 	srv := &http.Server{
 		Addr:    ":8080",
@@ -78,6 +60,52 @@ func main() {
 	logger.Info("server exited")
 }
 
+func demoConfig() ratelimiter.Config {
+	return ratelimiter.Config{
+		Algorithm: ratelimiter.TokenBucket,
+		Rate:      10,
+		BurstSize: 20,
+		Window:    time.Second,
+	}
+}
+
+func buildMux(limiter ratelimiter.Limiter, cfg ratelimiter.Config) (*http.ServeMux, *ratelimiter.Counters) {
+	counters := ratelimiter.NewCounters()
+	observer := ratelimiter.NewSlogObserver(slog.Default())
+
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("pong"))
+	})
+
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(counters.Snapshot())
+	})
+
+	rateLimitedHandler := middleware.MiddlewareWithOptions(
+		limiter,
+		cfg,
+		extractKey,
+		middleware.WithObserver(counters),
+		middleware.WithObserver(observer),
+		middleware.WithFailOpen(),
+		middleware.WithStandardHeaders(),
+	)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"message": "resource accessed",
+		})
+	}))
+	mux.Handle("/api/resource", rateLimitedHandler)
+
+	return mux, counters
+}
+
 func getEnv(key, defaultValue string) string {
 	if value, exists := os.LookupEnv(key); exists {
 		return value
@@ -105,18 +133,9 @@ func initStore(redisAddr string, logger *slog.Logger) (ratelimiter.Store, string
 }
 
 func extractKey(r *http.Request) ratelimiter.Key {
-	if clientID := r.Header.Get("X-Client-ID"); clientID != "" {
-		return ratelimiter.Key(clientID)
+	if clientID := ratelimiter.HeaderKeyFunc("X-Client-ID")(r); clientID != "" {
+		return clientID
 	}
 
-	ip := r.RemoteAddr
-	if colonIdx := len(ip) - 1; colonIdx > 0 {
-		for i := colonIdx - 1; i >= 0; i-- {
-			if ip[i] == ':' {
-				ip = ip[:i]
-				break
-			}
-		}
-	}
-	return ratelimiter.Key(ip)
+	return ratelimiter.RemoteIPKeyFunc()(r)
 }

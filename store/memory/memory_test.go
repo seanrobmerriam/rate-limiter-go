@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ratelimiter/ratelimiter"
+	ratelimiter "github.com/seanrobmerriam/rate-limiter-go"
 	"github.com/stretchr/testify/assert"
 )
 

@@ -1,10 +1,12 @@
 package ratelimiter_test
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
-	"github.com/ratelimiter/ratelimiter"
+	ratelimiter "github.com/seanrobmerriam/rate-limiter-go"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -156,4 +158,49 @@ func TestAlgorithm_Constants(t *testing.T) {
 func TestStatus_Constants(t *testing.T) {
 	assert.Equal(t, string(ratelimiter.Allowed), "allowed", "Allowed constant should be 'allowed'")
 	assert.Equal(t, string(ratelimiter.Denied), "denied", "Denied constant should be 'denied'")
+}
+
+func TestHeaderKeyFunc(t *testing.T) {
+	keyFn := ratelimiter.HeaderKeyFunc("X-Client-ID")
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("X-Client-ID", "client-123")
+
+	assert.Equal(t, ratelimiter.Key("client-123"), keyFn(req))
+}
+
+func TestRemoteIPKeyFunc(t *testing.T) {
+	t.Run("strips port from remote address", func(t *testing.T) {
+		keyFn := ratelimiter.RemoteIPKeyFunc()
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = "203.0.113.10:54321"
+
+		assert.Equal(t, ratelimiter.Key("203.0.113.10"), keyFn(req))
+	})
+
+	t.Run("preserves bare remote address", func(t *testing.T) {
+		keyFn := ratelimiter.RemoteIPKeyFunc()
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = "198.51.100.8"
+
+		assert.Equal(t, ratelimiter.Key("198.51.100.8"), keyFn(req))
+	})
+}
+
+func TestConfigWithKey(t *testing.T) {
+	original := ratelimiter.Config{
+		Key:       ratelimiter.Key("original"),
+		Algorithm: ratelimiter.TokenBucket,
+		Rate:      10,
+		BurstSize: 5,
+		Window:    time.Second,
+	}
+
+	updated := original.WithKey(ratelimiter.Key("updated"))
+
+	assert.Equal(t, ratelimiter.Key("original"), original.Key)
+	assert.Equal(t, ratelimiter.Key("updated"), updated.Key)
+	assert.Equal(t, original.Algorithm, updated.Algorithm)
+	assert.Equal(t, original.Rate, updated.Rate)
+	assert.Equal(t, original.BurstSize, updated.BurstSize)
+	assert.Equal(t, original.Window, updated.Window)
 }

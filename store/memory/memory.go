@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ratelimiter/ratelimiter"
+	ratelimiter "github.com/seanrobmerriam/rate-limiter-go"
 )
 
 type MemoryStore struct {

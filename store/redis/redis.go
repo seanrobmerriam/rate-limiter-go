@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 
-	"github.com/ratelimiter/ratelimiter"
+	ratelimiter "github.com/seanrobmerriam/rate-limiter-go"
 )
 
 const (
@@ -29,8 +31,7 @@ var (
 		local ttl = tonumber(ARGV[5])
 		
 		local data = redis.call('HGETALL', key)
-		local isNew = (#data == 0)
-		local tokens = burst - 1
+		local tokens = burst
 		local lastRefill = now
 		
 		if #data > 0 then
@@ -53,20 +54,20 @@ var (
 		end
 		
 		if tokens >= 1 then
-			local remaining = tokens
-			if isNew then
-				remaining = burst - 1
+			local remaining = math.floor(tokens - 1)
+			if remaining < 0 then
+				remaining = 0
 			end
 			redis.call('HSET', key, 'tokens', tokens - 1, 'last_refill', now)
-			redis.call('EXPIRE', key, ttl)
+			redis.call('PEXPIRE', key, ttl)
 			return {1, remaining, 0}
 		else
-			local retryAfter = (window - elapsed) / rate
+			local retryAfter = math.ceil(((1 - tokens) * window) / rate)
 			if retryAfter < 1 then
 				retryAfter = 1
 			end
 			redis.call('HSET', key, 'tokens', tokens, 'last_refill', now)
-			redis.call('EXPIRE', key, ttl)
+			redis.call('PEXPIRE', key, ttl)
 			return {0, 0, retryAfter}
 		end
 	`)
@@ -85,7 +86,7 @@ var (
 		
 		if count < rate then
 			redis.call('ZADD', key, now, member)
-			redis.call('EXPIRE', key, ttl)
+			redis.call('PEXPIRE', key, ttl)
 			local remaining = rate - count - 1
 			if remaining < 0 then
 				remaining = 0
@@ -95,12 +96,12 @@ var (
 			local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
 			local retryAfter = 0
 			if #oldest > 0 then
-				retryAfter = now - tonumber(oldest[2])
+				retryAfter = tonumber(oldest[2]) + window - now
 				if retryAfter < 1 then
 					retryAfter = 1
 				end
 			end
-			redis.call('EXPIRE', key, ttl)
+			redis.call('PEXPIRE', key, ttl)
 			return {0, 0, retryAfter}
 		end
 	`)
@@ -111,6 +112,7 @@ var (
 type RedisStore struct {
 	client *redis.Client
 	logger *slog.Logger
+	closed atomic.Bool
 }
 
 // New creates a new Redis store with the given address.
@@ -118,6 +120,9 @@ type RedisStore struct {
 func New(addr string) (*RedisStore, error) {
 	if addr == "" {
 		return nil, errors.New("Redis address is required")
+	}
+	if _, _, err := net.SplitHostPort(addr); err != nil {
+		return nil, fmt.Errorf("invalid Redis address: %w", err)
 	}
 	client := redis.NewClient(&redis.Options{
 		Addr: addr,
@@ -144,15 +149,15 @@ func NewWithClient(client *redis.Client) *RedisStore {
 func (s *RedisStore) TokenBucketCheck(ctx context.Context, key ratelimiter.Key, rate int, burst int, window time.Duration) (ratelimiter.Result, error) {
 	storeKey := fmt.Sprintf(tokenBucketKeyPrefix, key)
 	now := time.Now()
-	ttl := int(window.Seconds() * 2)
+	ttl := int((window * 2).Milliseconds())
 	if ttl <= 0 {
-		ttl = int(defaultTTL.Seconds())
+		ttl = int(defaultTTL.Milliseconds())
 	}
 
 	result, err := tokenBucketScript.Run(ctx, s.client, []string{storeKey},
 		rate,
 		burst,
-		int(window.Seconds()),
+		window.Milliseconds(),
 		now.UnixMilli(),
 		ttl,
 	).Slice()
@@ -171,8 +176,7 @@ func (s *RedisStore) TokenBucketCheck(ctx context.Context, key ratelimiter.Key, 
 	allowed := result[0].(int64) == 1
 	remaining := int(result[1].(int64))
 	retryAfter := time.Duration(result[2].(int64)) * time.Millisecond
-
-	if !allowed {
+	if !allowed && retryAfter <= 0 {
 		retryAfter = time.Duration(float64(window) / float64(rate))
 		if retryAfter <= 0 {
 			retryAfter = time.Second
@@ -201,16 +205,16 @@ func (s *RedisStore) TokenBucketCheck(ctx context.Context, key ratelimiter.Key, 
 func (s *RedisStore) SlidingWindowCheck(ctx context.Context, key ratelimiter.Key, rate int, window time.Duration) (ratelimiter.Result, error) {
 	storeKey := fmt.Sprintf(slidingWindowKeyPrefix, key)
 	now := time.Now()
-	ttl := int(window.Seconds() * 2)
+	ttl := int((window * 2).Milliseconds())
 	if ttl <= 0 {
-		ttl = int(defaultTTL.Seconds())
+		ttl = int(defaultTTL.Milliseconds())
 	}
 
 	member := uuid.New().String()
 
 	result, err := slidingWindowScript.Run(ctx, s.client, []string{storeKey},
 		rate,
-		int(window.Seconds()),
+		window.Milliseconds(),
 		now.UnixMilli(),
 		ttl,
 		member,
@@ -282,5 +286,8 @@ func (s *RedisStore) Ping(ctx context.Context) error {
 
 // Close closes the Redis client connection.
 func (s *RedisStore) Close() error {
+	if s.closed.Swap(true) {
+		return nil
+	}
 	return s.client.Close()
 }

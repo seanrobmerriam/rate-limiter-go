@@ -30,6 +30,11 @@ type Config struct {
 	BurstSize int
 }
 
+func (c Config) WithKey(key Key) Config {
+	c.Key = key
+	return c
+}
+
 func (c Config) Validate() error {
 	if c.Algorithm == "" {
 		return errors.New("algorithm is required")

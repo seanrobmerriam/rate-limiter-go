@@ -5,7 +5,7 @@ A high-performance rate limiting library for Go applications, supporting both to
 ## Installation
 
 ```bash
-go get github.com/ratelimiter/ratelimiter
+go get github.com/seanrobmerriam/rate-limiter-go
 ```
 
 ## Quickstart
@@ -14,14 +14,14 @@ go get github.com/ratelimiter/ratelimiter
 package main
 
 import (
-    "context"
-    "log"
+    "log/slog"
     "net/http"
+    "os"
     "time"
 
-    "github.com/ratelimiter/ratelimiter"
-    "github.com/ratelimiter/ratelimiter/middleware"
-    "github.com/ratelimiter/ratelimiter/store/memory"
+    ratelimiter "github.com/seanrobmerriam/rate-limiter-go"
+    "github.com/seanrobmerriam/rate-limiter-go/middleware"
+    "github.com/seanrobmerriam/rate-limiter-go/store/memory"
 )
 
 func main() {
@@ -47,11 +47,98 @@ func main() {
     }
 
     // Wrap your handler with rate limiting middleware
-    handler := middleware.Middleware(limiter, cfg, keyFn)
+    counters := ratelimiter.NewCounters()
+    logger := ratelimiter.NewSlogObserver(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
-    http.ListenAndServe(":8080", handler)
+    handler := middleware.MiddlewareWithOptions(limiter, cfg, keyFn,
+        middleware.WithObserver(counters),
+        middleware.WithObserver(logger),
+    )(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        w.WriteHeader(http.StatusOK)
+        _, _ = w.Write([]byte("ok"))
+    }))
+
+    _ = http.ListenAndServe(":8080", handler)
 }
 ```
+
+## Observability
+
+The middleware can emit structured events through observers. The library includes:
+
+- `ratelimiter.ObserverFunc` for lightweight callbacks
+- `ratelimiter.NewCounters()` for in-process allow/deny/error counts
+- `ratelimiter.NewSlogObserver(...)` for structured `slog` output
+
+Use `middleware.MiddlewareWithOptions(...)` with `middleware.WithObserver(...)` to attach one or more observers.
+
+## Integration Helpers
+
+The root package includes small helpers for common `net/http` integrations:
+
+- `ratelimiter.HeaderKeyFunc("X-Client-ID")` to derive keys from request headers
+- `ratelimiter.RemoteIPKeyFunc()` to derive keys from `RemoteAddr`
+- `cfg.WithKey(key)` to clone a shared config safely for per-request use
+
+## Chi Integration
+
+The middleware package includes a Chi adapter and a route-param key helper:
+
+```go
+router := chi.NewRouter()
+router.Use(middleware.Chi(
+    limiter,
+    cfg,
+    middleware.ChiURLParamKeyFunc("accountID"),
+    middleware.WithStandardHeaders(),
+))
+
+router.Get("/accounts/{accountID}", func(w http.ResponseWriter, r *http.Request) {
+    w.WriteHeader(http.StatusOK)
+})
+```
+
+This is useful when the rate-limit key comes from Chi route params rather than headers or remote IPs.
+
+## Gin Integration
+
+The middleware package also includes a Gin adapter with a Gin route-param key helper:
+
+```go
+router := gin.New()
+router.Use(middleware.Gin(
+    limiter,
+    cfg,
+    middleware.GinParamKeyFunc("accountID"),
+    middleware.WithStandardHeaders(),
+))
+
+router.GET("/accounts/:accountID", func(c *gin.Context) {
+    c.Status(http.StatusOK)
+})
+```
+
+Use this when the rate-limit key should come from Gin route params while keeping the same middleware options and observer behavior as the `net/http` and Chi adapters.
+
+## Demo App
+
+The demo server now shows the full middleware option surface working together:
+
+- observers via `ratelimiter.NewCounters()` and `ratelimiter.NewSlogObserver(...)`
+- fail-open behavior with `middleware.WithFailOpen()`
+- standard rate-limit headers with `middleware.WithStandardHeaders()`
+- a `/metrics` endpoint exposing observer counter totals as JSON
+
+Run it with:
+
+```bash
+go run ./cmd/demo
+```
+
+Then try:
+
+- `curl -i localhost:8080/api/resource -H 'X-Client-ID: demo-client'`
+- `curl localhost:8080/metrics`
 
 ## Algorithm Explanation
 

@@ -5,10 +5,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/ratelimiter/ratelimiter"
+	ratelimiter "github.com/seanrobmerriam/rate-limiter-go"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -236,4 +237,329 @@ func TestMiddleware_IndependentRateLimitsByKey(t *testing.T) {
 	assert.Equal(t, 2, key2HandlerCalls, "key2 handler should be called twice (first 2 requests allowed)")
 	assert.Equal(t, 3, callCounts[ratelimiter.Key("key1")], "limiter should be called 3 times for key1")
 	assert.Equal(t, 3, callCounts[ratelimiter.Key("key2")], "limiter should be called 3 times for key2")
+}
+
+func TestMiddleware_Observability(t *testing.T) {
+	t.Run("allowed requests emit an allowed event", func(t *testing.T) {
+		var (
+			mu    sync.Mutex
+			event ratelimiter.Event
+		)
+
+		limiter := &mockLimiter{
+			checkFunc: func(ctx context.Context, cfg ratelimiter.Config) (ratelimiter.Result, error) {
+				return ratelimiter.Result{
+					Status:    ratelimiter.Allowed,
+					Remaining: 4,
+					ResetAt:   time.Now().Add(time.Second),
+				}, nil
+			},
+		}
+
+		handler := MiddlewareWithOptions(
+			limiter,
+			ratelimiter.Config{Algorithm: ratelimiter.TokenBucket, Rate: 5, BurstSize: 5, Window: time.Second},
+			func(r *http.Request) ratelimiter.Key { return ratelimiter.Key("allowed-client") },
+			WithObserver(ratelimiter.ObserverFunc(func(ctx context.Context, got ratelimiter.Event) {
+				mu.Lock()
+				defer mu.Unlock()
+				event = got
+			})),
+		)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+
+		handler.ServeHTTP(w, req)
+
+		mu.Lock()
+		defer mu.Unlock()
+		assert.Equal(t, ratelimiter.EventAllowed, event.Kind)
+		assert.Equal(t, ratelimiter.Key("allowed-client"), event.Key)
+		assert.Equal(t, ratelimiter.TokenBucket, event.Algorithm)
+		assert.Equal(t, ratelimiter.Allowed, event.Status)
+		assert.Equal(t, 4, event.Remaining)
+		assert.GreaterOrEqual(t, event.Duration, time.Duration(0))
+	})
+
+	t.Run("denied requests emit retry metadata", func(t *testing.T) {
+		var event ratelimiter.Event
+
+		limiter := &mockLimiter{
+			checkFunc: func(ctx context.Context, cfg ratelimiter.Config) (ratelimiter.Result, error) {
+				return ratelimiter.Result{
+					Status:     ratelimiter.Denied,
+					RetryAfter: 3 * time.Second,
+					ResetAt:    time.Now().Add(3 * time.Second),
+				}, nil
+			},
+		}
+
+		handler := MiddlewareWithOptions(
+			limiter,
+			ratelimiter.Config{Algorithm: ratelimiter.SlidingWindow, Rate: 1, Window: time.Second},
+			func(r *http.Request) ratelimiter.Key { return ratelimiter.Key("denied-client") },
+			WithObserver(ratelimiter.ObserverFunc(func(ctx context.Context, got ratelimiter.Event) {
+				event = got
+			})),
+		)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+
+		handler.ServeHTTP(w, req)
+
+		assert.Equal(t, ratelimiter.EventDenied, event.Kind)
+		assert.Equal(t, ratelimiter.Key("denied-client"), event.Key)
+		assert.Equal(t, ratelimiter.SlidingWindow, event.Algorithm)
+		assert.Equal(t, ratelimiter.Denied, event.Status)
+		assert.Equal(t, 3*time.Second, event.RetryAfter)
+		assert.False(t, event.ResetAt.IsZero())
+	})
+
+	t.Run("limiter errors emit error events", func(t *testing.T) {
+		var event ratelimiter.Event
+
+		limiter := &mockLimiter{
+			checkFunc: func(ctx context.Context, cfg ratelimiter.Config) (ratelimiter.Result, error) {
+				return ratelimiter.Result{}, assert.AnError
+			},
+		}
+
+		handler := MiddlewareWithOptions(
+			limiter,
+			ratelimiter.Config{Algorithm: ratelimiter.TokenBucket, Rate: 2, BurstSize: 2, Window: time.Second},
+			func(r *http.Request) ratelimiter.Key { return ratelimiter.Key("error-client") },
+			WithObserver(ratelimiter.ObserverFunc(func(ctx context.Context, got ratelimiter.Event) {
+				event = got
+			})),
+		)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+
+		handler.ServeHTTP(w, req)
+
+		assert.Equal(t, ratelimiter.EventError, event.Kind)
+		assert.Equal(t, ratelimiter.Key("error-client"), event.Key)
+		assert.Equal(t, ratelimiter.TokenBucket, event.Algorithm)
+		assert.ErrorIs(t, event.Err, assert.AnError)
+		assert.GreaterOrEqual(t, event.Duration, time.Duration(0))
+	})
+}
+
+func TestMiddleware_Counters(t *testing.T) {
+	counters := ratelimiter.NewCounters()
+
+	results := []struct {
+		name   string
+		result ratelimiter.Result
+		err    error
+	}{
+		{
+			name: "allowed",
+			result: ratelimiter.Result{
+				Status:    ratelimiter.Allowed,
+				Remaining: 1,
+				ResetAt:   time.Now().Add(time.Second),
+			},
+		},
+		{
+			name: "denied",
+			result: ratelimiter.Result{
+				Status:     ratelimiter.Denied,
+				RetryAfter: time.Second,
+				ResetAt:    time.Now().Add(time.Second),
+			},
+		},
+		{
+			name: "error",
+			err:  assert.AnError,
+		},
+	}
+
+	for _, tt := range results {
+		t.Run(tt.name, func(t *testing.T) {
+			limiter := &mockLimiter{
+				checkFunc: func(ctx context.Context, cfg ratelimiter.Config) (ratelimiter.Result, error) {
+					return tt.result, tt.err
+				},
+			}
+
+			handler := MiddlewareWithOptions(
+				limiter,
+				ratelimiter.Config{Algorithm: ratelimiter.TokenBucket, Rate: 3, BurstSize: 3, Window: time.Second},
+				func(r *http.Request) ratelimiter.Key { return ratelimiter.Key(tt.name) },
+				WithObserver(counters),
+			)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/test", nil)
+			handler.ServeHTTP(w, req)
+		})
+	}
+
+	snapshot := counters.Snapshot()
+	assert.Equal(t, uint64(1), snapshot.Allowed)
+	assert.Equal(t, uint64(1), snapshot.Denied)
+	assert.Equal(t, uint64(1), snapshot.Errors)
+}
+
+func TestMiddleware_CustomHandlers(t *testing.T) {
+	t.Run("custom denied handler overrides default body", func(t *testing.T) {
+		limiter := &mockLimiter{
+			checkFunc: func(ctx context.Context, cfg ratelimiter.Config) (ratelimiter.Result, error) {
+				return ratelimiter.Result{
+					Status:     ratelimiter.Denied,
+					RetryAfter: 2 * time.Second,
+					ResetAt:    time.Now().Add(2 * time.Second),
+				}, nil
+			},
+		}
+
+		handler := MiddlewareWithOptions(
+			limiter,
+			ratelimiter.Config{Algorithm: ratelimiter.TokenBucket, Rate: 1, BurstSize: 1, Window: time.Second},
+			func(r *http.Request) ratelimiter.Key { return ratelimiter.Key("client") },
+			WithDeniedHandler(func(w http.ResponseWriter, r *http.Request, result ratelimiter.Result) {
+				w.Header().Set("Content-Type", "text/plain")
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte("blocked"))
+			}),
+		)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+		handler.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusForbidden, w.Code)
+		assert.Equal(t, "text/plain", w.Header().Get("Content-Type"))
+		assert.Equal(t, "blocked", w.Body.String())
+	})
+
+	t.Run("custom error handler can return caller response", func(t *testing.T) {
+		limiter := &mockLimiter{
+			checkFunc: func(ctx context.Context, cfg ratelimiter.Config) (ratelimiter.Result, error) {
+				return ratelimiter.Result{}, assert.AnError
+			},
+		}
+
+		handler := MiddlewareWithOptions(
+			limiter,
+			ratelimiter.Config{Algorithm: ratelimiter.TokenBucket, Rate: 1, BurstSize: 1, Window: time.Second},
+			func(r *http.Request) ratelimiter.Key { return ratelimiter.Key("client") },
+			WithErrorHandler(func(w http.ResponseWriter, r *http.Request, err error) bool {
+				w.WriteHeader(http.StatusBadGateway)
+				_, _ = w.Write([]byte("upstream limiter error"))
+				return false
+			}),
+		)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+		handler.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusBadGateway, w.Code)
+		assert.Equal(t, "upstream limiter error", w.Body.String())
+	})
+}
+
+func TestMiddleware_FailOpen(t *testing.T) {
+	handlerCalled := 0
+	limiter := &mockLimiter{
+		checkFunc: func(ctx context.Context, cfg ratelimiter.Config) (ratelimiter.Result, error) {
+			return ratelimiter.Result{}, assert.AnError
+		},
+	}
+
+	handler := MiddlewareWithOptions(
+		limiter,
+		ratelimiter.Config{Algorithm: ratelimiter.TokenBucket, Rate: 1, BurstSize: 1, Window: time.Second},
+		func(r *http.Request) ratelimiter.Key { return ratelimiter.Key("client") },
+		WithFailOpen(),
+	)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handlerCalled++
+		w.WriteHeader(http.StatusAccepted)
+	}))
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, 1, handlerCalled)
+	assert.Equal(t, http.StatusAccepted, w.Code)
+}
+
+func TestMiddleware_StandardHeaders(t *testing.T) {
+	t.Run("allowed responses include standard headers", func(t *testing.T) {
+		limiter := &mockLimiter{
+			checkFunc: func(ctx context.Context, cfg ratelimiter.Config) (ratelimiter.Result, error) {
+				return ratelimiter.Result{
+					Status:    ratelimiter.Allowed,
+					Remaining: 7,
+					ResetAt:   time.Now().Add(5 * time.Second),
+				}, nil
+			},
+		}
+
+		handler := MiddlewareWithOptions(
+			limiter,
+			ratelimiter.Config{Algorithm: ratelimiter.TokenBucket, Rate: 10, BurstSize: 10, Window: 5 * time.Second},
+			func(r *http.Request) ratelimiter.Key { return ratelimiter.Key("client") },
+			WithStandardHeaders(),
+		)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+		handler.ServeHTTP(w, req)
+
+		assert.Equal(t, "10", w.Header().Get("RateLimit-Limit"))
+		assert.Equal(t, "7", w.Header().Get("RateLimit-Remaining"))
+		assert.NotEmpty(t, w.Header().Get("RateLimit-Reset"))
+		assert.Equal(t, "7", w.Header().Get("X-RateLimit-Remaining"))
+	})
+
+	t.Run("denied responses include standard headers", func(t *testing.T) {
+		limiter := &mockLimiter{
+			checkFunc: func(ctx context.Context, cfg ratelimiter.Config) (ratelimiter.Result, error) {
+				return ratelimiter.Result{
+					Status:     ratelimiter.Denied,
+					RetryAfter: 4 * time.Second,
+					ResetAt:    time.Now().Add(4 * time.Second),
+				}, nil
+			},
+		}
+
+		handler := MiddlewareWithOptions(
+			limiter,
+			ratelimiter.Config{Algorithm: ratelimiter.SlidingWindow, Rate: 3, Window: 4 * time.Second},
+			func(r *http.Request) ratelimiter.Key { return ratelimiter.Key("client") },
+			WithStandardHeaders(),
+		)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+		handler.ServeHTTP(w, req)
+
+		assert.Equal(t, "3", w.Header().Get("RateLimit-Limit"))
+		assert.Equal(t, "0", w.Header().Get("RateLimit-Remaining"))
+		assert.NotEmpty(t, w.Header().Get("RateLimit-Reset"))
+		assert.Equal(t, "4", w.Header().Get("Retry-After"))
+	})
 }
