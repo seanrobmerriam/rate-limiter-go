@@ -65,8 +65,15 @@ type Result struct {
 	ResetAt    time.Time
 }
 
+type State struct {
+	Remaining int
+	ResetAt   time.Time
+}
+
 type Limiter interface {
 	Check(ctx context.Context, cfg Config) (Result, error)
+	Wait(ctx context.Context, cfg Config) error
+	Peek(ctx context.Context, cfg Config) (State, error)
 	Reset(ctx context.Context, key Key) error
 	ResetMulti(ctx context.Context, keys ...Key) error
 	Close() error
@@ -76,6 +83,7 @@ type Store interface {
 	TokenBucketCheck(ctx context.Context, key Key, rate int, burst int, window time.Duration) (Result, error)
 	SlidingWindowCheck(ctx context.Context, key Key, rate int, window time.Duration) (Result, error)
 	Check(ctx context.Context, cfg Config) (Result, error)
+	Peek(ctx context.Context, cfg Config) (State, error)
 	Reset(ctx context.Context, key Key) error
 	ResetMulti(ctx context.Context, keys ...Key) error
 	Ping(ctx context.Context) error

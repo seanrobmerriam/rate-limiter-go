@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -197,6 +198,62 @@ func (s *RedisStore) Check(ctx context.Context, cfg ratelimiter.Config) (ratelim
 		return s.SlidingWindowCheck(ctx, cfg.Key, cfg.Rate, cfg.Window)
 	default:
 		return ratelimiter.Result{}, fmt.Errorf("redis: unsupported algorithm: %s", cfg.Algorithm)
+	}
+}
+
+// Peek returns the current rate limit state without consuming a token.
+func (s *RedisStore) Peek(ctx context.Context, cfg ratelimiter.Config) (ratelimiter.State, error) {
+	if s.closed.Load() {
+		return ratelimiter.State{}, errors.New("store is closed")
+	}
+
+	now := time.Now()
+
+	switch cfg.Algorithm {
+	case ratelimiter.TokenBucket, ratelimiter.LeakyBucket:
+		storeKey := fmt.Sprintf(tokenBucketKeyPrefix, cfg.Key)
+		tokensStr, err := s.client.HGet(ctx, storeKey, "tokens").Result()
+		if err == redis.Nil {
+			burst := cfg.BurstSize
+			if cfg.Algorithm == ratelimiter.LeakyBucket && burst <= 0 {
+				burst = cfg.Rate
+			}
+			return ratelimiter.State{
+				Remaining: burst,
+				ResetAt:   now.Add(cfg.Window),
+			}, nil
+		}
+		if err != nil {
+			return ratelimiter.State{}, err
+		}
+
+		tokens, _ := strconv.ParseFloat(tokensStr, 64)
+		remaining := int(tokens)
+		if remaining < 0 {
+			remaining = 0
+		}
+		return ratelimiter.State{
+			Remaining: remaining,
+			ResetAt:   now.Add(cfg.Window),
+		}, nil
+
+	case ratelimiter.SlidingWindow, ratelimiter.FixedWindow:
+		storeKey := fmt.Sprintf(slidingWindowKeyPrefix, cfg.Key)
+		count, err := s.client.ZCard(ctx, storeKey).Result()
+		if err != nil {
+			return ratelimiter.State{}, err
+		}
+		remaining := int(cfg.Rate - int(count))
+		if remaining < 0 {
+			remaining = 0
+		}
+		return ratelimiter.State{
+			Remaining: remaining,
+			ResetAt:   now.Add(cfg.Window),
+		}, nil
+
+	default:
+		return ratelimiter.State{}, fmt.Errorf("redis: unsupported algorithm: %s", cfg.Algorithm)
 	}
 }
 

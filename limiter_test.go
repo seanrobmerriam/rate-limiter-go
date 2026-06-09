@@ -14,6 +14,7 @@ type mockStore struct {
 	tokenBucketCheckFunc   func(ctx context.Context, key ratelimiter.Key, rate int, burst int, window time.Duration) (ratelimiter.Result, error)
 	slidingWindowCheckFunc func(ctx context.Context, key ratelimiter.Key, rate int, window time.Duration) (ratelimiter.Result, error)
 	checkFunc              func(ctx context.Context, cfg ratelimiter.Config) (ratelimiter.Result, error)
+	peekFunc               func(ctx context.Context, cfg ratelimiter.Config) (ratelimiter.State, error)
 	resetFunc              func(ctx context.Context, key ratelimiter.Key) error
 	resetMultiFunc         func(ctx context.Context, keys ...ratelimiter.Key) error
 	pingFunc               func(ctx context.Context) error
@@ -22,6 +23,7 @@ type mockStore struct {
 	tokenBucketCheckCalled   bool
 	slidingWindowCheckCalled bool
 	checkCalled              bool
+	peekCalled               bool
 	resetCalled              bool
 	resetMultiCalled         bool
 	pingCalled               bool
@@ -57,6 +59,14 @@ func (m *mockStore) Check(ctx context.Context, cfg ratelimiter.Config) (ratelimi
 	default:
 		return ratelimiter.Result{}, nil
 	}
+}
+
+func (m *mockStore) Peek(ctx context.Context, cfg ratelimiter.Config) (ratelimiter.State, error) {
+	m.peekCalled = true
+	if m.peekFunc != nil {
+		return m.peekFunc(ctx, cfg)
+	}
+	return ratelimiter.State{}, nil
 }
 
 func (m *mockStore) Reset(ctx context.Context, key ratelimiter.Key) error {

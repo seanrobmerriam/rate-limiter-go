@@ -3,6 +3,7 @@ package ratelimiter
 import (
 	"context"
 	"fmt"
+	"time"
 )
 
 type limiter struct {
@@ -23,8 +24,45 @@ func (l *limiter) Check(ctx context.Context, cfg Config) (Result, error) {
 	if err := cfg.Validate(); err != nil {
 		return Result{}, err
 	}
-	
+
 	return l.store.Check(ctx, cfg)
+}
+
+// Peek returns the current rate limit state for the given config without consuming a token.
+func (l *limiter) Peek(ctx context.Context, cfg Config) (State, error) {
+	if err := cfg.Validate(); err != nil {
+		return State{}, err
+	}
+
+	return l.store.Peek(ctx, cfg)
+}
+
+// Wait blocks until a token is available or the context is cancelled.
+// It repeatedly polls Check and sleeps for RetryAfter on denial.
+// Returns nil when allowed, ctx.Err() if cancelled.
+func (l *limiter) Wait(ctx context.Context, cfg Config) error {
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+
+	for {
+		result, err := l.store.Check(ctx, cfg)
+		if err != nil {
+			return err
+		}
+
+		if result.Status == Allowed {
+			return nil
+		}
+
+		timer := time.NewTimer(result.RetryAfter)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 // Reset clears the rate limit state for the given key.

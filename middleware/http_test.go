@@ -37,6 +37,14 @@ func (m *mockLimiter) ResetMulti(ctx context.Context, keys ...ratelimiter.Key) e
 	return nil
 }
 
+func (m *mockLimiter) Wait(ctx context.Context, cfg ratelimiter.Config) error {
+	return nil
+}
+
+func (m *mockLimiter) Peek(ctx context.Context, cfg ratelimiter.Config) (ratelimiter.State, error) {
+	return ratelimiter.State{}, nil
+}
+
 func (m *mockLimiter) Close() error {
 	if m.closeFunc != nil {
 		return m.closeFunc()

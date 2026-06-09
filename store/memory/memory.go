@@ -115,6 +115,141 @@ func (s *MemoryStore) checkContext(ctx context.Context) error {
 	}
 }
 
+// Peek returns the current rate limit state without consuming a token.
+func (s *MemoryStore) Peek(ctx context.Context, cfg ratelimiter.Config) (ratelimiter.State, error) {
+	if err := s.checkContext(ctx); err != nil {
+		return ratelimiter.State{}, err
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if err := s.checkContext(ctx); err != nil {
+		return ratelimiter.State{}, err
+	}
+
+	if s.closed {
+		return ratelimiter.State{}, errors.New("store is closed")
+	}
+
+	now := time.Now()
+
+	switch cfg.Algorithm {
+	case ratelimiter.TokenBucket:
+		tb, exists := s.tokenBuckets[cfg.Key]
+		if !exists {
+			return ratelimiter.State{
+				Remaining: cfg.BurstSize,
+				ResetAt:   now.Add(cfg.Window),
+			}, nil
+		}
+
+		refillFrom := tb.lastRefill
+		if !tb.zeroTime.IsZero() {
+			refillFrom = tb.zeroTime
+		}
+
+		elapsed := now.Sub(refillFrom)
+		var tokens float64
+		if elapsed >= tb.window {
+			tokens = float64(tb.burst)
+		} else {
+			tokensToAdd := (float64(elapsed) * float64(tb.rate)) / float64(tb.window)
+			tokens = tb.tokens + tokensToAdd
+			if tokens > float64(tb.burst) {
+				tokens = float64(tb.burst)
+			}
+		}
+
+		remaining := int(tokens)
+		if remaining < 0 {
+			remaining = 0
+		}
+
+		return ratelimiter.State{
+			Remaining: remaining,
+			ResetAt:   now.Add(cfg.Window),
+		}, nil
+
+	case ratelimiter.SlidingWindow:
+		sw, exists := s.slidingWindows[cfg.Key]
+		if !exists {
+			return ratelimiter.State{
+				Remaining: cfg.Rate,
+				ResetAt:   now.Add(cfg.Window),
+			}, nil
+		}
+
+		validCount := 0
+		for _, t := range sw.requests {
+			if now.Sub(t) < sw.window {
+				validCount++
+			}
+		}
+
+		remaining := sw.rate - validCount
+		if remaining < 0 {
+			remaining = 0
+		}
+
+		return ratelimiter.State{
+			Remaining: remaining,
+			ResetAt:   now.Add(cfg.Window),
+		}, nil
+
+	case ratelimiter.LeakyBucket:
+		lb, exists := s.leakyBuckets[cfg.Key]
+		if !exists {
+			return ratelimiter.State{
+				Remaining: cfg.BurstSize,
+				ResetAt:   now.Add(cfg.Window),
+			}, nil
+		}
+
+		drainDuration := float64(lb.window) / float64(lb.rate)
+		drainCutoff := now.Add(-time.Duration(int64(len(lb.queue)) * int64(drainDuration)))
+
+		valid := 0
+		for _, t := range lb.queue {
+			if t.After(drainCutoff) {
+				valid++
+			}
+		}
+
+		remaining := lb.burst - valid
+		if remaining < 0 {
+			remaining = 0
+		}
+
+		return ratelimiter.State{
+			Remaining: remaining,
+			ResetAt:   now.Add(cfg.Window),
+		}, nil
+
+	case ratelimiter.FixedWindow:
+		fw, exists := s.fixedWindows[cfg.Key]
+		if !exists || now.Sub(fw.windowStart) >= fw.window {
+			return ratelimiter.State{
+				Remaining: cfg.Rate,
+				ResetAt:   now.Add(cfg.Window),
+			}, nil
+		}
+
+		remaining := fw.rate - fw.count
+		if remaining < 0 {
+			remaining = 0
+		}
+
+		return ratelimiter.State{
+			Remaining: remaining,
+			ResetAt:   fw.windowStart.Add(fw.window),
+		}, nil
+
+	default:
+		return ratelimiter.State{}, fmt.Errorf("memory: unsupported algorithm: %s", cfg.Algorithm)
+	}
+}
+
 // Check dispatches to the correct algorithm based on cfg.Algorithm.
 func (s *MemoryStore) Check(ctx context.Context, cfg ratelimiter.Config) (ratelimiter.Result, error) {
 	switch cfg.Algorithm {

@@ -39,6 +39,10 @@ func (s *fakeStore) Check(ctx context.Context, cfg ratelimiter.Config) (ratelimi
 	}
 }
 
+func (s *fakeStore) Peek(ctx context.Context, cfg ratelimiter.Config) (ratelimiter.State, error) {
+	return ratelimiter.State{}, nil
+}
+
 func (s *fakeStore) Reset(ctx context.Context, key ratelimiter.Key) error           { return nil }
 func (s *fakeStore) ResetMulti(ctx context.Context, keys ...ratelimiter.Key) error  { return nil }
 func (s *fakeStore) Ping(ctx context.Context) error                                 { return nil }
