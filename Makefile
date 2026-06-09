@@ -19,7 +19,7 @@ run-demo:
 	go run ./cmd/demo
 
 docker-up:
-	docker-compose up -d
+	docker compose up -d
 
 docker-down:
-	docker-compose down
+	docker compose down

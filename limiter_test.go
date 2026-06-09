@@ -13,13 +13,17 @@ import (
 type mockStore struct {
 	tokenBucketCheckFunc   func(ctx context.Context, key ratelimiter.Key, rate int, burst int, window time.Duration) (ratelimiter.Result, error)
 	slidingWindowCheckFunc func(ctx context.Context, key ratelimiter.Key, rate int, window time.Duration) (ratelimiter.Result, error)
+	checkFunc              func(ctx context.Context, cfg ratelimiter.Config) (ratelimiter.Result, error)
 	resetFunc              func(ctx context.Context, key ratelimiter.Key) error
+	resetMultiFunc         func(ctx context.Context, keys ...ratelimiter.Key) error
 	pingFunc               func(ctx context.Context) error
 	closeFunc              func() error
 
 	tokenBucketCheckCalled   bool
 	slidingWindowCheckCalled bool
+	checkCalled              bool
 	resetCalled              bool
+	resetMultiCalled         bool
 	pingCalled               bool
 	closeCalled              bool
 }
@@ -40,10 +44,33 @@ func (m *mockStore) SlidingWindowCheck(ctx context.Context, key ratelimiter.Key,
 	return ratelimiter.Result{}, nil
 }
 
+func (m *mockStore) Check(ctx context.Context, cfg ratelimiter.Config) (ratelimiter.Result, error) {
+	m.checkCalled = true
+	if m.checkFunc != nil {
+		return m.checkFunc(ctx, cfg)
+	}
+	switch cfg.Algorithm {
+	case ratelimiter.TokenBucket:
+		return m.TokenBucketCheck(ctx, cfg.Key, cfg.Rate, cfg.BurstSize, cfg.Window)
+	case ratelimiter.SlidingWindow:
+		return m.SlidingWindowCheck(ctx, cfg.Key, cfg.Rate, cfg.Window)
+	default:
+		return ratelimiter.Result{}, nil
+	}
+}
+
 func (m *mockStore) Reset(ctx context.Context, key ratelimiter.Key) error {
 	m.resetCalled = true
 	if m.resetFunc != nil {
 		return m.resetFunc(ctx, key)
+	}
+	return nil
+}
+
+func (m *mockStore) ResetMulti(ctx context.Context, keys ...ratelimiter.Key) error {
+	m.resetMultiCalled = true
+	if m.resetMultiFunc != nil {
+		return m.resetMultiFunc(ctx, keys...)
 	}
 	return nil
 }

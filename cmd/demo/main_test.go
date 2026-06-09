@@ -28,9 +28,21 @@ func (s *fakeStore) SlidingWindowCheck(ctx context.Context, key ratelimiter.Key,
 	return ratelimiter.Result{}, nil
 }
 
-func (s *fakeStore) Reset(ctx context.Context, key ratelimiter.Key) error { return nil }
-func (s *fakeStore) Ping(ctx context.Context) error                       { return nil }
-func (s *fakeStore) Close() error                                         { return nil }
+func (s *fakeStore) Check(ctx context.Context, cfg ratelimiter.Config) (ratelimiter.Result, error) {
+	switch cfg.Algorithm {
+	case ratelimiter.TokenBucket:
+		return s.TokenBucketCheck(ctx, cfg.Key, cfg.Rate, cfg.BurstSize, cfg.Window)
+	case ratelimiter.SlidingWindow:
+		return s.SlidingWindowCheck(ctx, cfg.Key, cfg.Rate, cfg.Window)
+	default:
+		return ratelimiter.Result{}, nil
+	}
+}
+
+func (s *fakeStore) Reset(ctx context.Context, key ratelimiter.Key) error           { return nil }
+func (s *fakeStore) ResetMulti(ctx context.Context, keys ...ratelimiter.Key) error  { return nil }
+func (s *fakeStore) Ping(ctx context.Context) error                                 { return nil }
+func (s *fakeStore) Close() error                                                   { return nil }
 
 func TestBuildMux_ExposesMetricsAndStandardHeaders(t *testing.T) {
 	store := &fakeStore{

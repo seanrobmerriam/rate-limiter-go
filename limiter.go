@@ -18,26 +18,27 @@ func New(store Store) Limiter {
 
 // Check determines if the request for the given key is allowed based on the configured algorithm.
 // It validates the config first and returns an error if invalid.
-// Dispatches to TokenBucketCheck or SlidingWindowCheck based on cfg.Algorithm.
+// Delegates to the store's Check method for algorithm dispatch.
 func (l *limiter) Check(ctx context.Context, cfg Config) (Result, error) {
 	if err := cfg.Validate(); err != nil {
 		return Result{}, err
 	}
-
-	switch cfg.Algorithm {
-	case TokenBucket:
-		return l.store.TokenBucketCheck(ctx, cfg.Key, cfg.Rate, cfg.BurstSize, cfg.Window)
-	case SlidingWindow:
-		return l.store.SlidingWindowCheck(ctx, cfg.Key, cfg.Rate, cfg.Window)
-	default:
-		return Result{}, fmt.Errorf("ratelimiter: check failed: %w", fmt.Errorf("unsupported algorithm: %s", cfg.Algorithm))
-	}
+	
+	return l.store.Check(ctx, cfg)
 }
 
 // Reset clears the rate limit state for the given key.
 func (l *limiter) Reset(ctx context.Context, key Key) error {
 	if err := l.store.Reset(ctx, key); err != nil {
 		return fmt.Errorf("ratelimiter: reset failed: %w", err)
+	}
+	return nil
+}
+
+// ResetMulti clears the rate limit state for the given keys.
+func (l *limiter) ResetMulti(ctx context.Context, keys ...Key) error {
+	if err := l.store.ResetMulti(ctx, keys...); err != nil {
+		return fmt.Errorf("ratelimiter: reset multi failed: %w", err)
 	}
 	return nil
 }

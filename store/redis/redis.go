@@ -110,7 +110,7 @@ var (
 // RedisStore implements the ratelimiter.Store interface backed by Redis.
 // It uses atomic Lua scripts for token bucket and sliding window algorithms.
 type RedisStore struct {
-	client *redis.Client
+	client redis.UniversalClient
 	logger *slog.Logger
 	closed atomic.Bool
 }
@@ -142,11 +142,72 @@ func NewWithClient(client *redis.Client) *RedisStore {
 	}
 }
 
+// NewCluster creates a new Redis store backed by a Redis cluster.
+// clusterAddrs are the seed node addresses.
+func NewCluster(clusterAddrs []string, opts ...func(*redis.ClusterOptions)) (*RedisStore, error) {
+	if len(clusterAddrs) == 0 {
+		return nil, errors.New("at least one cluster address is required")
+	}
+	clusterOpts := &redis.ClusterOptions{
+		Addrs: clusterAddrs,
+	}
+	for _, fn := range opts {
+		fn(clusterOpts)
+	}
+	client := redis.NewClusterClient(clusterOpts)
+	return &RedisStore{
+		client: client,
+		logger: slog.Default(),
+	}, nil
+}
+
+// NewSentinel creates a new Redis store backed by Redis Sentinel for high-availability.
+// masterName is the Sentinel master name and sentinelAddrs are the Sentinel node addresses.
+func NewSentinel(masterName string, sentinelAddrs []string, opts ...func(*redis.FailoverOptions)) (*RedisStore, error) {
+	if masterName == "" {
+		return nil, errors.New("sentinel master name is required")
+	}
+	if len(sentinelAddrs) == 0 {
+		return nil, errors.New("at least one sentinel address is required")
+	}
+	failoverOpts := &redis.FailoverOptions{
+		MasterName:    masterName,
+		SentinelAddrs: sentinelAddrs,
+	}
+	for _, fn := range opts {
+		fn(failoverOpts)
+	}
+	client := redis.NewFailoverClient(failoverOpts)
+	return &RedisStore{
+		client: client,
+		logger: slog.Default(),
+	}, nil
+}
+
+// Check dispatches to the correct algorithm based on cfg.Algorithm.
+func (s *RedisStore) Check(ctx context.Context, cfg ratelimiter.Config) (ratelimiter.Result, error) {
+	switch cfg.Algorithm {
+	case ratelimiter.TokenBucket:
+		return s.TokenBucketCheck(ctx, cfg.Key, cfg.Rate, cfg.BurstSize, cfg.Window)
+	case ratelimiter.SlidingWindow:
+		return s.SlidingWindowCheck(ctx, cfg.Key, cfg.Rate, cfg.Window)
+	case ratelimiter.LeakyBucket:
+		return s.TokenBucketCheck(ctx, cfg.Key, cfg.Rate, cfg.BurstSize, cfg.Window)
+	case ratelimiter.FixedWindow:
+		return s.SlidingWindowCheck(ctx, cfg.Key, cfg.Rate, cfg.Window)
+	default:
+		return ratelimiter.Result{}, fmt.Errorf("redis: unsupported algorithm: %s", cfg.Algorithm)
+	}
+}
+
 // TokenBucketCheck checks if a request is allowed using the token bucket algorithm.
 // It atomically retrieves the current token count, calculates tokens to add based on
 // elapsed time since last refill, and decrements a token if available.
 // Returns a Result with status Allowed/Denied, remaining tokens, retryAfter duration, and resetAt time.
 func (s *RedisStore) TokenBucketCheck(ctx context.Context, key ratelimiter.Key, rate int, burst int, window time.Duration) (ratelimiter.Result, error) {
+	if s.closed.Load() {
+		return ratelimiter.Result{}, errors.New("store is closed")
+	}
 	storeKey := fmt.Sprintf(tokenBucketKeyPrefix, key)
 	now := time.Now()
 	ttl := int((window * 2).Milliseconds())
@@ -173,17 +234,30 @@ func (s *RedisStore) TokenBucketCheck(ctx context.Context, key ratelimiter.Key, 
 		return ratelimiter.Result{}, errors.New("unexpected result from lua script")
 	}
 
-	allowed := result[0].(int64) == 1
-	remaining := int(result[1].(int64))
-	retryAfter := time.Duration(result[2].(int64)) * time.Millisecond
-	if !allowed && retryAfter <= 0 {
+	allowed, ok := result[0].(int64)
+	if !ok {
+		return ratelimiter.Result{}, errors.New("unexpected type for allowed from lua script")
+	}
+	remainingVal, ok := result[1].(int64)
+	if !ok {
+		return ratelimiter.Result{}, errors.New("unexpected type for remaining from lua script")
+	}
+	retryAfterVal, ok := result[2].(int64)
+	if !ok {
+		return ratelimiter.Result{}, errors.New("unexpected type for retryAfter from lua script")
+	}
+
+	allowedBool := allowed == 1
+	remaining := int(remainingVal)
+	retryAfter := time.Duration(retryAfterVal) * time.Millisecond
+	if !allowedBool && retryAfter <= 0 {
 		retryAfter = time.Duration(float64(window) / float64(rate))
 		if retryAfter <= 0 {
 			retryAfter = time.Second
 		}
 	}
 
-	if allowed {
+	if allowedBool {
 		return ratelimiter.Result{
 			Status:    ratelimiter.Allowed,
 			Remaining: remaining,
@@ -203,6 +277,9 @@ func (s *RedisStore) TokenBucketCheck(ctx context.Context, key ratelimiter.Key, 
 // and adds a new entry if under the rate limit.
 // Returns a Result with status Allowed/Denied, remaining slots, retryAfter duration, and resetAt time.
 func (s *RedisStore) SlidingWindowCheck(ctx context.Context, key ratelimiter.Key, rate int, window time.Duration) (ratelimiter.Result, error) {
+	if s.closed.Load() {
+		return ratelimiter.Result{}, errors.New("store is closed")
+	}
 	storeKey := fmt.Sprintf(slidingWindowKeyPrefix, key)
 	now := time.Now()
 	ttl := int((window * 2).Milliseconds())
@@ -231,11 +308,24 @@ func (s *RedisStore) SlidingWindowCheck(ctx context.Context, key ratelimiter.Key
 		return ratelimiter.Result{}, errors.New("unexpected result from lua script")
 	}
 
-	allowed := result[0].(int64) == 1
-	remaining := int(result[1].(int64))
-	retryAfter := time.Duration(result[2].(int64)) * time.Millisecond
+	allowed, ok := result[0].(int64)
+	if !ok {
+		return ratelimiter.Result{}, errors.New("unexpected type for allowed from lua script")
+	}
+	remainingVal, ok := result[1].(int64)
+	if !ok {
+		return ratelimiter.Result{}, errors.New("unexpected type for remaining from lua script")
+	}
+	retryAfterVal, ok := result[2].(int64)
+	if !ok {
+		return ratelimiter.Result{}, errors.New("unexpected type for retryAfter from lua script")
+	}
 
-	if allowed {
+	allowedBool := allowed == 1
+	remaining := int(remainingVal)
+	retryAfter := time.Duration(retryAfterVal) * time.Millisecond
+
+	if allowedBool {
 		return ratelimiter.Result{
 			Status:    ratelimiter.Allowed,
 			Remaining: remaining,
@@ -260,15 +350,32 @@ func (s *RedisStore) SlidingWindowCheck(ctx context.Context, key ratelimiter.Key
 
 // Reset removes all rate limit state (both token bucket and sliding window) for the given key.
 func (s *RedisStore) Reset(ctx context.Context, key ratelimiter.Key) error {
-	tbKey := fmt.Sprintf(tokenBucketKeyPrefix, key)
-	swKey := fmt.Sprintf(slidingWindowKeyPrefix, key)
+	return s.ResetMulti(ctx, key)
+}
 
-	_, err := s.client.Del(ctx, tbKey, swKey).Result()
+// ResetMulti removes all rate limit state for the given keys in a single pipeline round-trip.
+func (s *RedisStore) ResetMulti(ctx context.Context, keys ...ratelimiter.Key) error {
+	if s.closed.Load() {
+		return errors.New("store is closed")
+	}
+
+	if len(keys) == 0 {
+		return nil
+	}
+
+	pipe := s.client.Pipeline()
+	for _, key := range keys {
+		tbKey := fmt.Sprintf(tokenBucketKeyPrefix, key)
+		swKey := fmt.Sprintf(slidingWindowKeyPrefix, key)
+		pipe.Del(ctx, tbKey, swKey)
+	}
+
+	_, err := pipe.Exec(ctx)
 	if err != nil {
-		s.logger.Error("reset failed",
-			slog.String("key", string(key)),
+		s.logger.Error("reset multi failed",
+			slog.Any("keys", keys),
 			slog.Any("error", err))
-		return fmt.Errorf("reset failed: %w", err)
+		return fmt.Errorf("reset multi failed: %w", err)
 	}
 
 	return nil
@@ -276,6 +383,9 @@ func (s *RedisStore) Reset(ctx context.Context, key ratelimiter.Key) error {
 
 // Ping returns nil if the Redis connection is healthy, otherwise returns an error.
 func (s *RedisStore) Ping(ctx context.Context) error {
+	if s.closed.Load() {
+		return errors.New("store is closed")
+	}
 	_, err := s.client.Ping(ctx).Result()
 	if err != nil {
 		s.logger.Error("ping failed", slog.Any("error", err))
